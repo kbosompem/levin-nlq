@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# MLX / Training
+experiments/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+wandb/
+
+# Models (except releases)
+models/*
+!models/.gitkeep
+!models/releases/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs
+*.log
+logs/
