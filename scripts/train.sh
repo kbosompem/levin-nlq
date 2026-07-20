@@ -8,8 +8,12 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODELS_DIR="$PROJECT_DIR/models"
 DATA_DIR="$PROJECT_DIR/training-data"
 
-# Model configuration
-BASE_MODEL="HuggingFaceTB/SmolLM-135M-Instruct"
+# Model configuration.
+# Qwen2.5-Coder is heavily pretrained on code, which matters more than parameter
+# count here: the target language is s-expressions, and a code-pretrained base
+# produces balanced brackets and well-formed EDN far more reliably than a
+# general-purpose model of the same size. Costs ~300MB at 4-bit vs ~70MB.
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-Coder-0.5B-Instruct}"
 MLX_MODEL_DIR="$MODELS_DIR/smollm-mlx"
 ADAPTER_DIR="$MODELS_DIR/datalevin-adapter"
 FUSED_DIR="$MODELS_DIR/datalevin-fused"
@@ -18,11 +22,23 @@ echo "=== Datalevin NLQ Training Pipeline ==="
 echo "Project: $PROJECT_DIR"
 echo "Base model: $BASE_MODEL"
 
-# Check for virtual environment
+# Check for virtual environment.
+# MLX has no wheels for Python 3.14 (the current system default on this Mac), so
+# pin to a version that does rather than letting `python3` pick.
+PYBIN=""
+for candidate in python3.12 python3.11 python3.10; do
+    if command -v "$candidate" >/dev/null 2>&1; then PYBIN="$candidate"; break; fi
+done
+if [ -z "$PYBIN" ]; then
+    echo "Error: need Python 3.10-3.12 for MLX (found $(python3 --version))."
+    echo "Install one, e.g.: brew install python@3.12"
+    exit 1
+fi
+
 if [ ! -d "$PROJECT_DIR/venv" ]; then
     echo ""
-    echo "Creating virtual environment..."
-    python3 -m venv "$PROJECT_DIR/venv"
+    echo "Creating virtual environment with $PYBIN..."
+    "$PYBIN" -m venv "$PROJECT_DIR/venv"
 fi
 
 # Activate venv
@@ -59,15 +75,20 @@ echo "  Valid: $(wc -l < "$DATA_DIR/valid.jsonl") examples"
 # Fine-tune with LoRA
 echo ""
 echo "=== Starting LoRA Fine-tuning ==="
+# ~2600 training examples at batch 4 is ~650 steps/epoch, so 2000 iters is
+# roughly 3 epochs. Validation is schema-disjoint: val loss measures
+# generalization to an unseen schema, so watch it for divergence rather than
+# expecting it to track train loss.
 mlx_lm.lora \
     --model "$MLX_MODEL_DIR" \
     --data "$DATA_DIR" \
     --train \
     --batch-size 4 \
-    --lora-layers 4 \
-    --iters 500 \
+    --lora-layers 8 \
+    --iters 2000 \
     --adapter-path "$ADAPTER_DIR" \
     --learning-rate 1e-4 \
+    --steps-per-eval 200 \
     --seed 42
 
 echo ""
@@ -82,6 +103,6 @@ echo "=== Training Complete ==="
 echo "Fused model saved to: $FUSED_DIR"
 echo ""
 echo "Next steps:"
-echo "  1. Test the model: mlx_lm.generate --model $FUSED_DIR --prompt '<|user|>Schema: ...'"
+echo "  1. Test the model: python3 scripts/test-model.py"
 echo "  2. Quantize: ./scripts/quantize.sh"
 echo "  3. Export to ONNX: ./scripts/export-onnx.sh"

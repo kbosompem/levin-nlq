@@ -2,745 +2,1292 @@
 """
 Generate training data for Datalevin NLQ model.
 
-Produces JSONL files in the format expected by MLX fine-tuning:
-{"text": "<|user|>Schema: {...}\n\nQuery<|assistant|>[:find ...]"}
+Produces JSONL files in the format expected by MLX fine-tuning, wrapped in the
+base model's chat template (see CHAT_TEMPLATES / TEMPLATE below):
+{"text": "<|im_start|>user\nSchema: {...}\n\nQuery<|im_end|>..."}
+
+Design notes
+------------
+The model sees the schema in its prompt and must generalize to schemas it has
+never seen. That makes attribute-copying -- lifting the right `:ns/attr` out of
+the prompt -- the core skill, and *schema diversity* the binding constraint on
+whether it is learned rather than memorized.
+
+Two consequences shape this file:
+
+1. Examples are generated programmatically from typed schema definitions, not
+   hand-written per schema. Adding a schema costs ~10 lines and yields ~60
+   examples across every query pattern.
+
+2. The train/valid split is schema-disjoint (see HOLDOUT). Validation schemas
+   never appear in training, so validation loss measures generalization to an
+   unseen schema, which is the deployment condition.
 """
 
 import json
 import random
+import re
 from pathlib import Path
-from typing import List, Dict, Tuple
-from dataclasses import dataclass
+from typing import List, Optional
+from dataclasses import dataclass, field
 
-# Output paths
 OUTPUT_DIR = Path(__file__).parent.parent / "training-data"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 TRAIN_FILE = OUTPUT_DIR / "train.jsonl"
 VALID_FILE = OUTPUT_DIR / "valid.jsonl"
 
-# Validation split ratio
-VALID_RATIO = 0.1
+SEED = 42
+
+# Schemas held out entirely for validation. Chosen to span naming conventions
+# (abbreviated, kebab-case, plain) rather than to be a random sample.
+HOLDOUT = {"clinic", "airline", "podcast", "parking", "bugtracker"}
+
+
+# --------------------------------------------------------------------------
+# Schema model
+# --------------------------------------------------------------------------
+
+@dataclass
+class Attr:
+    name: str                            # "reorder-point" (bare, no namespace)
+    type: str                            # string|long|double|instant|boolean|keyword|ref
+    values: List[str] = field(default_factory=list)   # EDN literals for equality
+    nums: List[str] = field(default_factory=list)     # EDN numbers for comparison
+    subs: List[str] = field(default_factory=list)     # substrings for string ops
+    unique: bool = False
+    many: bool = False
+    fulltext: bool = False
+    ref_to: Optional[str] = None         # entity namespace this ref points at
+    label: Optional[str] = None          # human wording; defaults from name
+
+    def words(self) -> str:
+        if self.label:
+            return self.label
+        return DEFAULT_LABELS.get(self.name, self.name.replace("-", " "))
+
+    @property
+    def participle(self) -> bool:
+        """True when the attribute name reads as a past participle, so it can be
+        phrased directly ("posts published after 2024") rather than needing a
+        noun frame ("permits with expiry date after 2024")."""
+        return self.name.endswith("ed") and self.type == "instant"
+
+    def substrings(self) -> List[str]:
+        return self.subs or DEFAULT_SUBS.get(self.name, [])
+
+    @property
+    def numeric(self) -> bool:
+        return self.type in ("long", "double")
+
+
+@dataclass
+class Entity:
+    ns: str                              # "user"
+    noun: str                            # "user"
+    plural: str                          # "users"
+    primary: str                         # attr name used for "find all X"
+    attrs: List[Attr]
+
+    def kw(self, attr_name: str) -> str:
+        return f":{self.ns}/{attr_name}"
+
+    @property
+    def primary_kw(self) -> str:
+        return self.kw(self.primary)
+
+    def by_type(self, *types) -> List[Attr]:
+        return [a for a in self.attrs if a.type in types]
+
+    def scalars(self) -> List[Attr]:
+        return [a for a in self.attrs if a.type != "ref"]
 
 
 @dataclass
 class Schema:
-    """A sample schema for training examples."""
     name: str
-    edn: str
     description: str
+    entities: List[Entity]
+
+    @property
+    def edn(self) -> str:
+        lines = []
+        for e in self.entities:
+            for a in e.attrs:
+                opts = [f":db/valueType :db.type/{a.type}"]
+                if a.unique:
+                    opts.append(":db/unique :db.unique/identity")
+                if a.many:
+                    opts.append(":db/cardinality :db.cardinality/many")
+                if a.fulltext:
+                    opts.append(":db/fulltext true")
+                lines.append(f"{e.kw(a.name)} {{{' '.join(opts)}}}")
+        body = "\n ".join(lines)
+        return "{" + body + "}"
+
+    def entity(self, ns: str) -> Optional[Entity]:
+        return next((e for e in self.entities if e.ns == ns), None)
+
+    @property
+    def attr_kws(self) -> set:
+        return {e.kw(a.name) for e in self.entities for a in e.attrs}
 
 
 @dataclass
 class Example:
-    """A single training example."""
     schema: Schema
     natural: str
     query: str
     category: str
 
 
-# Sample schemas covering different domains
+def A(name, type_, **kw) -> Attr:
+    return Attr(name=name, type=type_, **kw)
+
+
+def E(ns, noun, plural, primary, attrs) -> Entity:
+    return Entity(ns=ns, noun=noun, plural=plural, primary=primary, attrs=attrs)
+
+
+# --------------------------------------------------------------------------
+# Schemas
+#
+# Naming conventions are deliberately inconsistent across schemas (kebab-case,
+# abbreviated, plain) so the model learns to copy attributes rather than to
+# recall a fixed vocabulary.
+# --------------------------------------------------------------------------
+
 SCHEMAS = [
-    Schema(
-        name="users",
-        edn="""{:user/name {:db/valueType :db.type/string}
- :user/email {:db/valueType :db.type/string :db/unique :db.unique/identity}
- :user/age {:db/valueType :db.type/long}
- :user/active {:db/valueType :db.type/boolean}
- :user/created {:db/valueType :db.type/instant}
- :user/role {:db/valueType :db.type/keyword}
- :user/friends {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}}""",
-        description="User management system"
-    ),
-    Schema(
-        name="ecommerce",
-        edn="""{:product/name {:db/valueType :db.type/string}
- :product/price {:db/valueType :db.type/double}
- :product/category {:db/valueType :db.type/keyword}
- :product/stock {:db/valueType :db.type/long}
- :product/active {:db/valueType :db.type/boolean}
- :order/user {:db/valueType :db.type/ref}
- :order/products {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
- :order/total {:db/valueType :db.type/double}
- :order/date {:db/valueType :db.type/instant}
- :order/status {:db/valueType :db.type/keyword}}""",
-        description="E-commerce platform"
-    ),
-    Schema(
-        name="blog",
-        edn="""{:post/title {:db/valueType :db.type/string :db/fulltext true}
- :post/body {:db/valueType :db.type/string :db/fulltext true}
- :post/author {:db/valueType :db.type/ref}
- :post/published {:db/valueType :db.type/instant}
- :post/tags {:db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
- :post/views {:db/valueType :db.type/long}
- :comment/post {:db/valueType :db.type/ref}
- :comment/author {:db/valueType :db.type/ref}
- :comment/text {:db/valueType :db.type/string}
- :comment/created {:db/valueType :db.type/instant}
- :author/name {:db/valueType :db.type/string}
- :author/bio {:db/valueType :db.type/string :db/fulltext true}}""",
-        description="Blog platform"
-    ),
-    Schema(
-        name="hr",
-        edn="""{:employee/name {:db/valueType :db.type/string}
- :employee/email {:db/valueType :db.type/string}
- :employee/department {:db/valueType :db.type/ref}
- :employee/manager {:db/valueType :db.type/ref}
- :employee/salary {:db/valueType :db.type/double}
- :employee/hired {:db/valueType :db.type/instant}
- :employee/title {:db/valueType :db.type/string}
- :department/name {:db/valueType :db.type/string}
- :department/budget {:db/valueType :db.type/double}}""",
-        description="HR management"
-    ),
-    Schema(
-        name="library",
-        edn="""{:book/title {:db/valueType :db.type/string :db/fulltext true}
- :book/author {:db/valueType :db.type/string}
- :book/isbn {:db/valueType :db.type/string :db/unique :db.unique/identity}
- :book/published {:db/valueType :db.type/instant}
- :book/genre {:db/valueType :db.type/keyword}
- :book/pages {:db/valueType :db.type/long}
- :loan/book {:db/valueType :db.type/ref}
- :loan/member {:db/valueType :db.type/ref}
- :loan/borrowed {:db/valueType :db.type/instant}
- :loan/due {:db/valueType :db.type/instant}
- :loan/returned {:db/valueType :db.type/instant}
- :member/name {:db/valueType :db.type/string}
- :member/email {:db/valueType :db.type/string}}""",
-        description="Library system"
-    ),
-    Schema(
-        name="inventory",
-        edn="""{:item/sku {:db/valueType :db.type/string :db/unique :db.unique/identity}
- :item/name {:db/valueType :db.type/string}
- :item/quantity {:db/valueType :db.type/long}
- :item/location {:db/valueType :db.type/ref}
- :item/reorder-point {:db/valueType :db.type/long}
- :item/unit-cost {:db/valueType :db.type/double}
- :location/name {:db/valueType :db.type/string}
- :location/type {:db/valueType :db.type/keyword}}""",
-        description="Inventory tracking"
-    ),
+    Schema("users", "User management", [
+        E("user", "user", "users", "name", [
+            A("name", "string", values=['"Alice"', '"John"'], subs=["Dr.", "A"]),
+            A("email", "string", unique=True, subs=["gmail", "company.com"]),
+            A("age", "long", nums=["18", "30", "65"]),
+            A("active", "boolean"),
+            A("created", "instant"),
+            A("role", "keyword", values=[":admin", ":moderator", ":guest"]),
+            A("friends", "ref", many=True, ref_to="user"),
+        ]),
+    ]),
+    Schema("ecommerce", "E-commerce platform", [
+        E("product", "product", "products", "name", [
+            A("name", "string", subs=["laptop", "Pro"]),
+            A("price", "double", nums=["50.0", "100.0", "500.0"]),
+            A("category", "keyword", values=[":electronics", ":clothing", ":books"]),
+            A("stock", "long", nums=["5", "10", "100"]),
+            A("active", "boolean"),
+        ]),
+        E("order", "order", "orders", "total", [
+            A("user", "ref", ref_to="customer"),
+            A("products", "ref", many=True, ref_to="product"),
+            A("total", "double", nums=["100.0", "500.0", "1000.0"]),
+            A("date", "instant"),
+            A("status", "keyword", values=[":pending", ":shipped", ":completed"]),
+        ]),
+        E("customer", "customer", "customers", "name", [
+            A("name", "string"),
+            A("email", "string", unique=True, subs=["gmail"]),
+        ]),
+    ]),
+    Schema("blog", "Blog platform", [
+        E("post", "post", "posts", "title", [
+            A("title", "string", fulltext=True, subs=["Clojure"]),
+            A("body", "string", fulltext=True),
+            A("author", "ref", ref_to="author"),
+            A("published", "instant"),
+            A("tags", "keyword", many=True, values=[":clojure", ":java", ":programming"]),
+            A("views", "long", nums=["100", "1000", "5000"]),
+        ]),
+        E("comment", "comment", "comments", "text", [
+            A("post", "ref", ref_to="post"),
+            A("author", "ref", ref_to="author"),
+            A("text", "string"),
+            A("created", "instant"),
+        ]),
+        E("author", "author", "authors", "name", [
+            A("name", "string"),
+            A("bio", "string", fulltext=True),
+        ]),
+    ]),
+    Schema("hr", "HR management", [
+        E("employee", "employee", "employees", "name", [
+            A("name", "string"),
+            A("email", "string", subs=["corp.com"]),
+            A("department", "ref", ref_to="department"),
+            A("manager", "ref", ref_to="employee"),
+            A("salary", "double", nums=["50000.0", "100000.0"]),
+            A("hired", "instant"),
+            A("title", "string", subs=["Senior"]),
+        ]),
+        E("department", "department", "departments", "name", [
+            A("name", "string"),
+            A("budget", "double", nums=["500000.0", "1000000.0"]),
+        ]),
+    ]),
+    Schema("library", "Library system", [
+        E("book", "book", "books", "title", [
+            A("title", "string", fulltext=True, subs=["adventure"]),
+            A("author", "string", subs=["Stephen"]),
+            A("isbn", "string", unique=True),
+            A("published", "instant"),
+            A("genre", "keyword", values=[":fiction", ":mystery", ":science-fiction"]),
+            A("pages", "long", nums=["200", "500"]),
+        ]),
+        E("loan", "loan", "loans", "borrowed", [
+            A("book", "ref", ref_to="book"),
+            A("member", "ref", ref_to="member"),
+            A("borrowed", "instant"),
+            A("due", "instant"),
+            A("returned", "instant"),
+        ]),
+        E("member", "member", "members", "name", [
+            A("name", "string"),
+            A("email", "string"),
+        ]),
+    ]),
+    Schema("inventory", "Inventory tracking", [
+        E("item", "item", "items", "name", [
+            A("sku", "string", unique=True),
+            A("name", "string"),
+            A("quantity", "long", nums=["10", "100"]),
+            A("location", "ref", ref_to="location"),
+            A("reorder-point", "long", nums=["20"]),
+            A("unit-cost", "double", nums=["25.0", "50.0"]),
+        ]),
+        E("location", "location", "locations", "name", [
+            A("name", "string"),
+            A("type", "keyword", values=[":warehouse", ":retail", ":transit"]),
+        ]),
+    ]),
+    Schema("school", "School records", [
+        E("student", "student", "students", "name", [
+            A("name", "string"),
+            A("grade", "long", nums=["9", "12"]),
+            A("gpa", "double", nums=["3.0", "3.5"]),
+            A("enrolled", "instant"),
+            A("advisor", "ref", ref_to="teacher"),
+        ]),
+        E("teacher", "teacher", "teachers", "name", [
+            A("name", "string"),
+            A("subject", "keyword", values=[":math", ":science", ":history"]),
+            A("tenured", "boolean"),
+        ]),
+        E("course", "course", "courses", "title", [
+            A("title", "string"),
+            A("teacher", "ref", ref_to="teacher"),
+            A("credits", "long", nums=["3", "4"]),
+            A("capacity", "long", nums=["30"]),
+        ]),
+    ]),
+    Schema("music", "Music catalog", [
+        E("track", "track", "tracks", "title", [
+            A("title", "string", fulltext=True),
+            A("artist", "ref", ref_to="artist"),
+            A("album", "ref", ref_to="album"),
+            A("duration", "long", nums=["180", "300"]),
+            A("plays", "long", nums=["1000", "50000"]),
+            A("genre", "keyword", values=[":rock", ":jazz", ":electronic"]),
+        ]),
+        E("artist", "artist", "artists", "name", [
+            A("name", "string"),
+            A("country", "keyword", values=[":us", ":uk", ":ng"]),
+        ]),
+        E("album", "album", "albums", "title", [
+            A("title", "string"),
+            A("released", "instant"),
+        ]),
+    ]),
+    Schema("restaurant", "Restaurant operations", [
+        E("dish", "dish", "dishes", "name", [
+            A("name", "string", subs=["chicken"]),
+            A("price", "double", nums=["12.0", "25.0"]),
+            A("course", "keyword", values=[":appetizer", ":main", ":dessert"]),
+            A("vegetarian", "boolean"),
+            A("calories", "long", nums=["500", "800"]),
+        ]),
+        E("reservation", "reservation", "reservations", "time", [
+            A("guest", "ref", ref_to="guest"),
+            A("time", "instant"),
+            A("party-size", "long", nums=["2", "6"]),
+            A("confirmed", "boolean"),
+        ]),
+        E("guest", "guest", "guests", "name", [
+            A("name", "string"),
+            A("phone", "string", unique=True),
+        ]),
+    ]),
+    Schema("banking", "Banking / accounts", [
+        E("acct", "account", "accounts", "num", [
+            A("num", "string", unique=True),
+            A("bal", "double", nums=["1000.0", "10000.0"], label="balance"),
+            A("kind", "keyword", values=[":checking", ":savings", ":credit"]),
+            A("holder", "ref", ref_to="cust"),
+            A("opened", "instant"),
+            A("frozen", "boolean"),
+        ]),
+        E("cust", "customer", "customers", "name", [
+            A("name", "string"),
+            A("ssn", "string", unique=True),
+            A("credit-score", "long", nums=["650", "750"]),
+        ]),
+        E("txn", "transaction", "transactions", "amt", [
+            A("acct", "ref", ref_to="acct"),
+            A("amt", "double", nums=["100.0", "5000.0"], label="amount"),
+            A("posted", "instant"),
+            A("kind", "keyword", values=[":debit", ":credit"]),
+        ]),
+    ]),
+    Schema("fleet", "Vehicle fleet", [
+        E("vehicle", "vehicle", "vehicles", "vin", [
+            A("vin", "string", unique=True),
+            A("make", "string"),
+            A("model", "string"),
+            A("mileage", "long", nums=["50000", "150000"]),
+            A("in-service", "boolean"),
+            A("acquired", "instant"),
+            A("driver", "ref", ref_to="driver"),
+        ]),
+        E("driver", "driver", "drivers", "name", [
+            A("name", "string"),
+            A("license", "string", unique=True),
+            A("status", "keyword", values=[":active", ":suspended"]),
+        ]),
+    ]),
+    Schema("realestate", "Real estate listings", [
+        E("listing", "listing", "listings", "address", [
+            A("address", "string", fulltext=True),
+            A("price", "double", nums=["250000.0", "750000.0"]),
+            A("bedrooms", "long", nums=["2", "4"]),
+            A("sqft", "long", nums=["1200", "3000"]),
+            A("listed", "instant"),
+            A("status", "keyword", values=[":available", ":pending", ":sold"]),
+            A("agent", "ref", ref_to="agent"),
+        ]),
+        E("agent", "agent", "agents", "name", [
+            A("name", "string"),
+            A("brokerage", "string"),
+            A("commission", "double", nums=["0.03"]),
+        ]),
+    ]),
+    Schema("issues", "Issue tracker", [
+        E("issue", "issue", "issues", "title", [
+            A("title", "string", fulltext=True),
+            A("body", "string", fulltext=True),
+            A("state", "keyword", values=[":open", ":closed"]),
+            A("priority", "keyword", values=[":low", ":high", ":urgent"]),
+            A("assignee", "ref", ref_to="dev"),
+            A("opened", "instant"),
+            A("labels", "keyword", many=True, values=[":bug", ":feature"]),
+        ]),
+        E("dev", "developer", "developers", "handle", [
+            A("handle", "string", unique=True),
+            A("name", "string"),
+            A("commits", "long", nums=["100", "1000"]),
+        ]),
+    ]),
+    Schema("gym", "Gym membership", [
+        E("member", "member", "members", "name", [
+            A("name", "string"),
+            A("joined", "instant"),
+            A("tier", "keyword", values=[":basic", ":premium"]),
+            A("dues", "double", nums=["29.99", "79.99"]),
+            A("active", "boolean"),
+        ]),
+        E("session", "session", "sessions", "start", [
+            A("member", "ref", ref_to="member"),
+            A("trainer", "ref", ref_to="trainer"),
+            A("start", "instant"),
+            A("minutes", "long", nums=["30", "60"]),
+        ]),
+        E("trainer", "trainer", "trainers", "name", [
+            A("name", "string"),
+            A("specialty", "keyword", values=[":strength", ":cardio"]),
+        ]),
+    ]),
+    Schema("recipes", "Recipe collection", [
+        E("recipe", "recipe", "recipes", "name", [
+            A("name", "string", fulltext=True),
+            A("instructions", "string", fulltext=True),
+            A("prep-minutes", "long", nums=["15", "45"]),
+            A("servings", "long", nums=["4"]),
+            A("cuisine", "keyword", values=[":italian", ":thai", ":ghanaian"]),
+            A("ingredients", "ref", many=True, ref_to="ingredient"),
+        ]),
+        E("ingredient", "ingredient", "ingredients", "name", [
+            A("name", "string"),
+            A("cost", "double", nums=["2.5"]),
+            A("allergen", "boolean"),
+        ]),
+    ]),
+    Schema("hotel", "Hotel bookings", [
+        E("room", "room", "rooms", "number", [
+            A("number", "string", unique=True),
+            A("rate", "double", nums=["120.0", "350.0"]),
+            A("beds", "long", nums=["1", "2"]),
+            A("kind", "keyword", values=[":standard", ":suite"]),
+            A("smoking", "boolean"),
+        ]),
+        E("booking", "booking", "bookings", "checkin", [
+            A("room", "ref", ref_to="room"),
+            A("guest", "ref", ref_to="guest"),
+            A("checkin", "instant"),
+            A("checkout", "instant"),
+            A("nights", "long", nums=["2", "7"]),
+        ]),
+        E("guest", "guest", "guests", "name", [
+            A("name", "string"),
+            A("loyalty-id", "string", unique=True),
+        ]),
+    ]),
+    Schema("insurance", "Insurance policies", [
+        E("policy", "policy", "policies", "number", [
+            A("number", "string", unique=True),
+            A("premium", "double", nums=["500.0", "2000.0"]),
+            A("kind", "keyword", values=[":auto", ":home", ":life"]),
+            A("holder", "ref", ref_to="holder"),
+            A("effective", "instant"),
+            A("lapsed", "boolean"),
+        ]),
+        E("claim", "claim", "claims", "amount", [
+            A("policy", "ref", ref_to="policy"),
+            A("amount", "double", nums=["1000.0", "25000.0"]),
+            A("filed", "instant"),
+            A("status", "keyword", values=[":filed", ":approved", ":denied"]),
+        ]),
+        E("holder", "policyholder", "policyholders", "name", [
+            A("name", "string"),
+            A("dob", "instant"),
+        ]),
+    ]),
+    Schema("farm", "Farm management", [
+        E("field", "field", "fields", "name", [
+            A("name", "string"),
+            A("acres", "double", nums=["40.0", "200.0"]),
+            A("crop", "keyword", values=[":maize", ":cassava", ":soy"]),
+            A("irrigated", "boolean"),
+        ]),
+        E("harvest", "harvest", "harvests", "date", [
+            A("field", "ref", ref_to="field"),
+            A("date", "instant"),
+            A("yield-tons", "double", nums=["10.0", "50.0"]),
+        ]),
+    ]),
+    Schema("legal", "Legal case management", [
+        E("case", "case", "cases", "caption", [
+            A("caption", "string", fulltext=True),
+            A("filed", "instant"),
+            A("court", "keyword", values=[":district", ":appellate"]),
+            A("lead", "ref", ref_to="atty"),
+            A("closed", "boolean"),
+        ]),
+        E("atty", "attorney", "attorneys", "name", [
+            A("name", "string"),
+            A("bar-no", "string", unique=True),
+            A("rate", "double", nums=["350.0", "800.0"]),
+        ]),
+    ]),
+    Schema("events", "Event management", [
+        E("event", "event", "events", "title", [
+            A("title", "string", fulltext=True),
+            A("starts", "instant"),
+            A("capacity", "long", nums=["50", "500"]),
+            A("venue", "ref", ref_to="venue"),
+            A("category", "keyword", values=[":conference", ":concert", ":workshop"]),
+        ]),
+        E("ticket", "ticket", "tickets", "price", [
+            A("event", "ref", ref_to="event"),
+            A("attendee", "ref", ref_to="attendee"),
+            A("price", "double", nums=["25.0", "150.0"]),
+            A("scanned", "boolean"),
+        ]),
+        E("attendee", "attendee", "attendees", "name", [
+            A("name", "string"),
+            A("email", "string", unique=True, subs=["gmail"]),
+        ]),
+        E("venue", "venue", "venues", "name", [
+            A("name", "string"),
+            A("city", "string"),
+        ]),
+    ]),
+    Schema("crm", "Sales CRM", [
+        E("lead", "lead", "leads", "company", [
+            A("company", "string"),
+            A("value", "double", nums=["5000.0", "50000.0"]),
+            A("stage", "keyword", values=[":new", ":qualified", ":won", ":lost"]),
+            A("owner", "ref", ref_to="rep"),
+            A("created", "instant"),
+        ]),
+        E("rep", "sales rep", "sales reps", "name", [
+            A("name", "string"),
+            A("quota", "double", nums=["100000.0"]),
+            A("region", "keyword", values=[":emea", ":apac", ":amer"]),
+        ]),
+    ]),
+    Schema("telecom", "Telecom subscribers", [
+        E("sub", "subscriber", "subscribers", "msisdn", [
+            A("msisdn", "string", unique=True),
+            A("plan", "ref", ref_to="plan"),
+            A("data-mb", "long", nums=["1000", "20000"]),
+            A("activated", "instant"),
+            A("roaming", "boolean"),
+        ]),
+        E("plan", "plan", "plans", "name", [
+            A("name", "string"),
+            A("monthly", "double", nums=["15.0", "60.0"]),
+            A("tier", "keyword", values=[":prepaid", ":postpaid"]),
+        ]),
+    ]),
+    Schema("museum", "Museum collection", [
+        E("artifact", "artifact", "artifacts", "title", [
+            A("title", "string", fulltext=True),
+            A("provenance", "string", fulltext=True),
+            A("acquired", "instant"),
+            A("era", "keyword", values=[":ancient", ":medieval", ":modern"]),
+            A("appraisal", "double", nums=["10000.0", "500000.0"]),
+            A("on-display", "boolean"),
+        ]),
+        E("exhibit", "exhibit", "exhibits", "name", [
+            A("name", "string"),
+            A("curator", "ref", ref_to="curator"),
+            A("opens", "instant"),
+        ]),
+        E("curator", "curator", "curators", "name", [
+            A("name", "string"),
+            A("tenure-years", "long", nums=["5", "20"]),
+        ]),
+    ]),
+    Schema("lab", "Laboratory samples", [
+        E("sample", "sample", "samples", "barcode", [
+            A("barcode", "string", unique=True),
+            A("collected", "instant"),
+            A("kind", "keyword", values=[":blood", ":tissue", ":swab"]),
+            A("volume-ml", "double", nums=["2.5", "10.0"]),
+            A("contaminated", "boolean"),
+            A("assay", "ref", ref_to="assay"),
+        ]),
+        E("assay", "assay", "assays", "name", [
+            A("name", "string"),
+            A("turnaround-hours", "long", nums=["24", "72"]),
+        ]),
+    ]),
+    Schema("shipping", "Freight and shipments", [
+        E("shipment", "shipment", "shipments", "tracking", [
+            A("tracking", "string", unique=True),
+            A("weight-kg", "double", nums=["5.0", "500.0"]),
+            A("shipped", "instant"),
+            A("delivered", "instant"),
+            A("status", "keyword", values=[":in-transit", ":delivered", ":lost"]),
+            A("carrier", "ref", ref_to="carrier"),
+        ]),
+        E("carrier", "carrier", "carriers", "name", [
+            A("name", "string"),
+            A("scac", "string", unique=True),
+        ]),
+    ]),
+    Schema("sports", "Sports league", [
+        E("player", "player", "players", "name", [
+            A("name", "string"),
+            A("position", "keyword", values=[":forward", ":midfield", ":keeper"]),
+            A("goals", "long", nums=["5", "20"]),
+            A("team", "ref", ref_to="team"),
+            A("debut", "instant"),
+        ]),
+        E("team", "team", "teams", "name", [
+            A("name", "string"),
+            A("city", "string"),
+            A("founded", "instant"),
+            A("payroll", "double", nums=["1000000.0"]),
+        ]),
+    ]),
+
+    # ---- held out for validation ----
+    Schema("clinic", "Medical clinic", [
+        E("patient", "patient", "patients", "name", [
+            A("name", "string"),
+            A("mrn", "string", unique=True),
+            A("dob", "instant"),
+            A("bloodtype", "keyword", values=[":a-pos", ":o-neg"]),
+            A("primary-doc", "ref", ref_to="doctor"),
+        ]),
+        E("visit", "visit", "visits", "date", [
+            A("patient", "ref", ref_to="patient"),
+            A("doctor", "ref", ref_to="doctor"),
+            A("date", "instant"),
+            A("charge", "double", nums=["150.0", "900.0"]),
+            A("followup", "boolean"),
+        ]),
+        E("doctor", "doctor", "doctors", "name", [
+            A("name", "string"),
+            A("specialty", "keyword", values=[":cardiology", ":pediatrics"]),
+            A("npi", "string", unique=True),
+        ]),
+    ]),
+    Schema("airline", "Airline operations", [
+        E("flight", "flight", "flights", "number", [
+            A("number", "string"),
+            A("departs", "instant"),
+            A("duration-min", "long", nums=["90", "600"]),
+            A("aircraft", "ref", ref_to="aircraft"),
+            A("status", "keyword", values=[":scheduled", ":delayed", ":cancelled"]),
+        ]),
+        E("aircraft", "aircraft", "aircraft", "tail", [
+            A("tail", "string", unique=True),
+            A("model", "string"),
+            A("seats", "long", nums=["150", "300"]),
+            A("hours", "double", nums=["10000.0"]),
+        ]),
+        E("pax", "passenger", "passengers", "name", [
+            A("name", "string"),
+            A("flight", "ref", ref_to="flight"),
+            A("fare", "double", nums=["200.0", "1500.0"]),
+            A("checked-in", "boolean"),
+        ]),
+    ]),
+    Schema("podcast", "Podcast network", [
+        E("episode", "episode", "episodes", "title", [
+            A("title", "string", fulltext=True),
+            A("notes", "string", fulltext=True),
+            A("published", "instant"),
+            A("duration-sec", "long", nums=["1800", "5400"]),
+            A("downloads", "long", nums=["1000", "100000"]),
+            A("show", "ref", ref_to="show"),
+        ]),
+        E("show", "show", "shows", "name", [
+            A("name", "string"),
+            A("category", "keyword", values=[":tech", ":comedy", ":news"]),
+            A("host", "ref", ref_to="host"),
+        ]),
+        E("host", "host", "hosts", "name", [
+            A("name", "string"),
+            A("followers", "long", nums=["5000", "200000"]),
+        ]),
+    ]),
+    Schema("parking", "Parking garage", [
+        E("spot", "spot", "spots", "code", [
+            A("code", "string", unique=True),
+            A("level", "long", nums=["1", "5"]),
+            A("kind", "keyword", values=[":compact", ":ev", ":handicap"]),
+            A("occupied", "boolean"),
+            A("hourly", "double", nums=["3.5", "8.0"]),
+        ]),
+        E("permit", "permit", "permits", "plate", [
+            A("plate", "string", unique=True),
+            A("spot", "ref", ref_to="spot"),
+            A("issued", "instant"),
+            A("expires", "instant"),
+        ]),
+    ]),
+    Schema("bugtracker", "Defect tracking", [
+        E("defect", "defect", "defects", "summary", [
+            A("summary", "string", fulltext=True),
+            A("repro", "string", fulltext=True),
+            A("sev", "keyword", values=[":s1", ":s2", ":s3"], label="severity"),
+            A("found", "instant"),
+            A("fixed", "instant"),
+            A("reporter", "ref", ref_to="qa"),
+            A("dupe-of", "ref", ref_to="defect"),
+        ]),
+        E("qa", "tester", "testers", "name", [
+            A("name", "string"),
+            A("team", "keyword", values=[":core", ":platform"]),
+        ]),
+    ]),
 ]
 
 
-def generate_basic_finds(schema: Schema) -> List[Example]:
-    """Generate basic find all queries."""
-    examples = []
+# --------------------------------------------------------------------------
+# Pattern generators
+#
+# Each takes a Schema and returns Examples. They walk the typed schema, so a
+# new schema automatically gets full coverage.
+# --------------------------------------------------------------------------
 
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find all users", "[:find ?e :where [?e :user/name _]]", "basic"),
-            Example(schema, "Get all users", "[:find ?e :where [?e :user/name _]]", "basic"),
-            Example(schema, "Show me all users", "[:find ?e :where [?e :user/name _]]", "basic"),
-            Example(schema, "List every user", "[:find ?e :where [?e :user/name _]]", "basic"),
-            Example(schema, "Find all user names", "[:find ?name :where [_ :user/name ?name]]", "basic"),
-            Example(schema, "Get user names and emails", "[:find ?name ?email :where [?e :user/name ?name] [?e :user/email ?email]]", "basic"),
-            Example(schema, "Show all user emails", "[:find ?email :where [_ :user/email ?email]]", "basic"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find all products", "[:find ?e :where [?e :product/name _]]", "basic"),
-            Example(schema, "List all orders", "[:find ?e :where [?e :order/total _]]", "basic"),
-            Example(schema, "Get product names and prices", "[:find ?name ?price :where [?e :product/name ?name] [?e :product/price ?price]]", "basic"),
-            Example(schema, "Show all product categories", "[:find ?cat :where [_ :product/category ?cat]]", "basic"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find all posts", "[:find ?e :where [?e :post/title _]]", "basic"),
-            Example(schema, "List all comments", "[:find ?e :where [?e :comment/text _]]", "basic"),
-            Example(schema, "Get post titles", "[:find ?title :where [_ :post/title ?title]]", "basic"),
-            Example(schema, "Show all authors", "[:find ?e :where [?e :author/name _]]", "basic"),
-            Example(schema, "Get author names", "[:find ?name :where [_ :author/name ?name]]", "basic"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find all employees", "[:find ?e :where [?e :employee/name _]]", "basic"),
-            Example(schema, "List all departments", "[:find ?e :where [?e :department/name _]]", "basic"),
-            Example(schema, "Get employee names and titles", "[:find ?name ?title :where [?e :employee/name ?name] [?e :employee/title ?title]]", "basic"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find all books", "[:find ?e :where [?e :book/title _]]", "basic"),
-            Example(schema, "List all members", "[:find ?e :where [?e :member/name _]]", "basic"),
-            Example(schema, "Get book titles and authors", "[:find ?title ?author :where [?e :book/title ?title] [?e :book/author ?author]]", "basic"),
-            Example(schema, "Show all loans", "[:find ?e :where [?e :loan/book _]]", "basic"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Find all items", "[:find ?e :where [?e :item/name _]]", "basic"),
-            Example(schema, "List all locations", "[:find ?e :where [?e :location/name _]]", "basic"),
-            Example(schema, "Get item names and quantities", "[:find ?name ?qty :where [?e :item/name ?name] [?e :item/quantity ?qty]]", "basic"),
-        ])
+YEARS = ["2020", "2022", "2024"]
 
-    return examples
+# Attribute names whose literal spelling reads badly in a prompt. Keeps the
+# natural-language side sounding like something a person would actually type.
+DEFAULT_LABELS = {
+    "duration-min": "duration", "duration-sec": "duration", "data-mb": "data usage",
+    "yield-tons": "yield", "volume-ml": "volume", "weight-kg": "weight",
+    "prep-minutes": "prep time", "tenure-years": "tenure",
+    "turnaround-hours": "turnaround", "bar-no": "bar number",
+    "msisdn": "phone number", "npi": "NPI", "scac": "SCAC code",
+    "mrn": "medical record number", "vin": "VIN", "ssn": "SSN", "gpa": "GPA",
+    "dob": "date of birth", "sqft": "square footage", "checkin": "check-in date",
+    "checkout": "check-out date", "dupe-of": "duplicate of",
+    "in-service": "in service", "on-display": "on display",
+    "checked-in": "checked in", "primary-doc": "primary doctor",
+    "monthly": "monthly rate", "hourly": "hourly rate", "hours": "airframe hours",
+    "departs": "departure time", "starts": "start time", "opens": "opening date",
+    "expires": "expiry date", "due": "due date", "effective": "effective date",
+    "found": "date found", "fixed": "date fixed", "num": "number",
+    "amt": "amount", "bal": "balance", "sev": "severity", "kind": "type",
+}
+
+# Substrings for string predicates, so more string attrs get realistic coverage
+# without annotating every schema by hand.
+DEFAULT_SUBS = {
+    "name": ["Smith"], "title": ["Guide"], "email": ["gmail"],
+    "address": ["Main"], "city": ["Accra"], "model": ["X"],
+    "make": ["Toyota"], "company": ["Corp"], "caption": ["Estate"],
+    "summary": ["crash"], "handle": ["dev"], "plate": ["GR"],
+    "tracking": ["1Z"], "number": ["A"], "code": ["B"],
+}
 
 
-def generate_equality_filters(schema: Schema) -> List[Example]:
-    """Generate equality filter queries."""
-    examples = []
+def g_basic(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        find_all = f"[:find ?e :where [?e {e.primary_kw} _]]"
+        for nl in (f"Find all {e.plural}",
+                   f"Get all {e.plural}",
+                   f"Show me all {e.plural}",
+                   f"List every {e.noun}"):
+            out.append(Example(s, nl, find_all, "basic"))
 
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find users named John", '[:find ?e :where [?e :user/name "John"]]', "filter"),
-            Example(schema, "Find users named Alice", '[:find ?e :where [?e :user/name "Alice"]]', "filter"),
-            Example(schema, "Get user with email john@example.com", '[:find ?e :where [?e :user/email "john@example.com"]]', "filter"),
-            Example(schema, "Find active users", "[:find ?e :where [?e :user/active true]]", "filter"),
-            Example(schema, "Find inactive users", "[:find ?e :where [?e :user/active false]]", "filter"),
-            Example(schema, "Find admin users", "[:find ?e :where [?e :user/role :admin]]", "filter"),
-            Example(schema, "Find users with role moderator", "[:find ?e :where [?e :user/role :moderator]]", "filter"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find products in electronics category", "[:find ?e :where [?e :product/category :electronics]]", "filter"),
-            Example(schema, "Find active products", "[:find ?e :where [?e :product/active true]]", "filter"),
-            Example(schema, "Find pending orders", "[:find ?e :where [?e :order/status :pending]]", "filter"),
-            Example(schema, "Find completed orders", "[:find ?e :where [?e :order/status :completed]]", "filter"),
-            Example(schema, "Find shipped orders", "[:find ?e :where [?e :order/status :shipped]]", "filter"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find posts tagged with clojure", "[:find ?e :where [?e :post/tags :clojure]]", "filter"),
-            Example(schema, "Find posts tagged programming", "[:find ?e :where [?e :post/tags :programming]]", "filter"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find fiction books", "[:find ?e :where [?e :book/genre :fiction]]", "filter"),
-            Example(schema, "Find science fiction books", "[:find ?e :where [?e :book/genre :science-fiction]]", "filter"),
-            Example(schema, "Find mystery books", "[:find ?e :where [?e :book/genre :mystery]]", "filter"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Find items in warehouse", "[:find ?e :where [?e :item/location ?loc] [?loc :location/type :warehouse]]", "filter"),
-        ])
-
-    return examples
+        scalars = [a for a in e.scalars() if not a.many]
+        for a in scalars[:3]:
+            out.append(Example(
+                s, f"Find all {e.noun} {a.words()}s",
+                f"[:find ?v :where [_ {e.kw(a.name)} ?v]]", "basic"))
+        if len(scalars) >= 2:
+            a, b = scalars[0], scalars[1]
+            out.append(Example(
+                s, f"Get {e.noun} {a.words()} and {b.words()}",
+                f"[:find ?a ?b :where [?e {e.kw(a.name)} ?a] [?e {e.kw(b.name)} ?b]]",
+                "basic"))
+        if len(scalars) >= 3:
+            a, b, c = scalars[0], scalars[1], scalars[2]
+            out.append(Example(
+                s, f"Show {e.noun} {a.words()}, {b.words()} and {c.words()}",
+                f"[:find ?a ?b ?c :where [?e {e.kw(a.name)} ?a] "
+                f"[?e {e.kw(b.name)} ?b] [?e {e.kw(c.name)} ?c]]", "basic"))
+    return out
 
 
-def generate_comparison_filters(schema: Schema) -> List[Example]:
-    """Generate comparison filter queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find users older than 30", "[:find ?e :where [?e :user/age ?age] [(> ?age 30)]]", "comparison"),
-            Example(schema, "Find users younger than 25", "[:find ?e :where [?e :user/age ?age] [(< ?age 25)]]", "comparison"),
-            Example(schema, "Find users aged 18 or older", "[:find ?e :where [?e :user/age ?age] [(>= ?age 18)]]", "comparison"),
-            Example(schema, "Find users under 65", "[:find ?e :where [?e :user/age ?age] [(< ?age 65)]]", "comparison"),
-            Example(schema, "Find users between 20 and 40", "[:find ?e :where [?e :user/age ?age] [(>= ?age 20)] [(<= ?age 40)]]", "comparison"),
-            Example(schema, "Users with age greater than 50", "[:find ?e :where [?e :user/age ?age] [(> ?age 50)]]", "comparison"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find products under $50", "[:find ?e :where [?e :product/price ?p] [(< ?p 50.0)]]", "comparison"),
-            Example(schema, "Find products over $100", "[:find ?e :where [?e :product/price ?p] [(> ?p 100.0)]]", "comparison"),
-            Example(schema, "Find products priced between $10 and $50", "[:find ?e :where [?e :product/price ?p] [(>= ?p 10.0)] [(<= ?p 50.0)]]", "comparison"),
-            Example(schema, "Find products with low stock", "[:find ?e :where [?e :product/stock ?s] [(< ?s 10)]]", "comparison"),
-            Example(schema, "Find products with stock below 5", "[:find ?e :where [?e :product/stock ?s] [(< ?s 5)]]", "comparison"),
-            Example(schema, "Find orders over $1000", "[:find ?e :where [?e :order/total ?t] [(> ?t 1000.0)]]", "comparison"),
-            Example(schema, "Orders with total greater than 500", "[:find ?e :where [?e :order/total ?t] [(> ?t 500.0)]]", "comparison"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find posts with more than 1000 views", "[:find ?e :where [?e :post/views ?v] [(> ?v 1000)]]", "comparison"),
-            Example(schema, "Find popular posts with over 5000 views", "[:find ?e :where [?e :post/views ?v] [(> ?v 5000)]]", "comparison"),
-            Example(schema, "Posts with less than 100 views", "[:find ?e :where [?e :post/views ?v] [(< ?v 100)]]", "comparison"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find employees earning over 100000", "[:find ?e :where [?e :employee/salary ?s] [(> ?s 100000.0)]]", "comparison"),
-            Example(schema, "Find employees with salary under 50000", "[:find ?e :where [?e :employee/salary ?s] [(< ?s 50000.0)]]", "comparison"),
-            Example(schema, "Employees earning between 60000 and 80000", "[:find ?e :where [?e :employee/salary ?s] [(>= ?s 60000.0)] [(<= ?s 80000.0)]]", "comparison"),
-            Example(schema, "Find departments with budget over 1 million", "[:find ?e :where [?e :department/budget ?b] [(> ?b 1000000.0)]]", "comparison"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find books with more than 500 pages", "[:find ?e :where [?e :book/pages ?p] [(> ?p 500)]]", "comparison"),
-            Example(schema, "Find short books under 200 pages", "[:find ?e :where [?e :book/pages ?p] [(< ?p 200)]]", "comparison"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Find items below reorder point", "[:find ?e :where [?e :item/quantity ?q] [?e :item/reorder-point ?r] [(< ?q ?r)]]", "comparison"),
-            Example(schema, "Find items with quantity over 100", "[:find ?e :where [?e :item/quantity ?q] [(> ?q 100)]]", "comparison"),
-            Example(schema, "Find expensive items over $50 unit cost", "[:find ?e :where [?e :item/unit-cost ?c] [(> ?c 50.0)]]", "comparison"),
-        ])
-
-    return examples
+def g_equality(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.attrs:
+            kw = e.kw(a.name)
+            if a.type == "boolean":
+                out.append(Example(s, f"Find {a.words()} {e.plural}",
+                                   f"[:find ?e :where [{'?e'} {kw} true]]", "filter"))
+                out.append(Example(s, f"Find {e.plural} where {a.words()} is false",
+                                   f"[:find ?e :where [?e {kw} false]]", "filter"))
+            for v in a.values:
+                pretty = v.lstrip(':').strip('"')
+                if a.type == "keyword":
+                    out.append(Example(s, f"Find {e.plural} with {a.words()} {pretty}",
+                                       f"[:find ?e :where [?e {kw} {v}]]", "filter"))
+                elif a.type == "string":
+                    out.append(Example(s, f"Find {e.plural} whose {a.words()} is {pretty}",
+                                       f"[:find ?e :where [?e {kw} {v}]]", "filter"))
+    return out
 
 
-def generate_string_operations(schema: Schema) -> List[Example]:
-    """Generate string operation queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find users with gmail addresses", '[:find ?e :where [?e :user/email ?email] [(clojure.string/includes? ?email "gmail")]]', "string"),
-            Example(schema, "Find users with yahoo email", '[:find ?e :where [?e :user/email ?email] [(clojure.string/includes? ?email "yahoo")]]', "string"),
-            Example(schema, "Find users with company email", '[:find ?e :where [?e :user/email ?email] [(clojure.string/ends-with? ?email "company.com")]]', "string"),
-            Example(schema, "Find users whose name starts with A", '[:find ?e :where [?e :user/name ?name] [(clojure.string/starts-with? ?name "A")]]', "string"),
-            Example(schema, "Find users with Dr. title", '[:find ?e :where [?e :user/name ?name] [(clojure.string/starts-with? ?name "Dr.")]]', "string"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find products containing laptop in name", '[:find ?e :where [?e :product/name ?name] [(clojure.string/includes? ?name "laptop")]]', "string"),
-            Example(schema, "Find products with Pro in name", '[:find ?e :where [?e :product/name ?name] [(clojure.string/includes? ?name "Pro")]]', "string"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find employees with corporate email", '[:find ?e :where [?e :employee/email ?email] [(clojure.string/ends-with? ?email "corp.com")]]', "string"),
-            Example(schema, "Find senior employees by title", '[:find ?e :where [?e :employee/title ?title] [(clojure.string/starts-with? ?title "Senior")]]', "string"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find books by author Stephen", '[:find ?e :where [?e :book/author ?author] [(clojure.string/starts-with? ?author "Stephen")]]', "string"),
-        ])
-
-    return examples
+def g_comparison(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.by_type("long", "double"):
+            kw, w = e.kw(a.name), a.words()
+            for n in a.nums:
+                out.append(Example(s, f"Find {e.plural} with {w} greater than {n}",
+                                   f"[:find ?e :where [?e {kw} ?v] [(> ?v {n})]]", "comparison"))
+                out.append(Example(s, f"Find {e.plural} with {w} under {n}",
+                                   f"[:find ?e :where [?e {kw} ?v] [(< ?v {n})]]", "comparison"))
+                out.append(Example(s, f"Find {e.plural} with {w} of at least {n}",
+                                   f"[:find ?e :where [?e {kw} ?v] [(>= ?v {n})]]", "comparison"))
+            if len(a.nums) >= 2:
+                lo, hi = a.nums[0], a.nums[1]
+                out.append(Example(s, f"Find {e.plural} with {w} between {lo} and {hi}",
+                                   f"[:find ?e :where [?e {kw} ?v] [(>= ?v {lo})] [(<= ?v {hi})]]",
+                                   "comparison"))
+        nums = e.by_type("long", "double")
+        if len(nums) >= 2:
+            a, b = nums[0], nums[1]
+            out.append(Example(
+                s, f"Find {e.plural} where {a.words()} is below {b.words()}",
+                f"[:find ?e :where [?e {e.kw(a.name)} ?x] [?e {e.kw(b.name)} ?y] [(< ?x ?y)]]",
+                "comparison"))
+    return out
 
 
-def generate_date_operations(schema: Schema) -> List[Example]:
-    """Generate date comparison queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find users created after 2024", '[:find ?e :where [?e :user/created ?d] [(> ?d #inst "2024-01-01")]]', "date"),
-            Example(schema, "Find users who joined in 2023", '[:find ?e :where [?e :user/created ?d] [(>= ?d #inst "2023-01-01")] [(< ?d #inst "2024-01-01")]]', "date"),
-            Example(schema, "Find users created before 2020", '[:find ?e :where [?e :user/created ?d] [(< ?d #inst "2020-01-01")]]', "date"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find orders from 2024", '[:find ?e :where [?e :order/date ?d] [(>= ?d #inst "2024-01-01")]]', "date"),
-            Example(schema, "Find orders before December 2023", '[:find ?e :where [?e :order/date ?d] [(< ?d #inst "2023-12-01")]]', "date"),
-            Example(schema, "Find recent orders after March 2024", '[:find ?e :where [?e :order/date ?d] [(> ?d #inst "2024-03-01")]]', "date"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find posts published in 2024", '[:find ?e :where [?e :post/published ?d] [(>= ?d #inst "2024-01-01")]]', "date"),
-            Example(schema, "Find old posts before 2020", '[:find ?e :where [?e :post/published ?d] [(< ?d #inst "2020-01-01")]]', "date"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find employees hired after 2022", '[:find ?e :where [?e :employee/hired ?d] [(> ?d #inst "2022-01-01")]]', "date"),
-            Example(schema, "Find employees hired before 2015", '[:find ?e :where [?e :employee/hired ?d] [(< ?d #inst "2015-01-01")]]', "date"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find books published after 2000", '[:find ?e :where [?e :book/published ?d] [(> ?d #inst "2000-01-01")]]', "date"),
-            Example(schema, "Find overdue loans", '[:find ?e :in $ ?now :where [?e :loan/due ?due] [(< ?due ?now)] (not [?e :loan/returned _])]', "date"),
-            Example(schema, "Find loans due before today", '[:find ?e :in $ ?now :where [?e :loan/due ?due] [(< ?due ?now)]]', "date"),
-        ])
-
-    return examples
+def g_string(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.by_type("string"):
+            kw, w = e.kw(a.name), a.words()
+            for sub in a.substrings():
+                out.append(Example(
+                    s, f"Find {e.plural} whose {w} contains {sub}",
+                    f'[:find ?e :where [?e {kw} ?v] [(clojure.string/includes? ?v "{sub}")]]',
+                    "string"))
+                out.append(Example(
+                    s, f"Find {e.plural} whose {w} starts with {sub}",
+                    f'[:find ?e :where [?e {kw} ?v] [(clojure.string/starts-with? ?v "{sub}")]]',
+                    "string"))
+                out.append(Example(
+                    s, f"Find {e.plural} whose {w} ends with {sub}",
+                    f'[:find ?e :where [?e {kw} ?v] [(clojure.string/ends-with? ?v "{sub}")]]',
+                    "string"))
+    return out
 
 
-def generate_aggregations(schema: Schema) -> List[Example]:
-    """Generate aggregation queries."""
-    examples = []
+def g_dates(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.by_type("instant"):
+            kw, w = e.kw(a.name), a.words()
 
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Count all users", "[:find (count ?e) :where [?e :user/name _]]", "aggregation"),
-            Example(schema, "Count active users", "[:find (count ?e) :where [?e :user/active true]]", "aggregation"),
-            Example(schema, "Average user age", "[:find (avg ?age) :where [?e :user/age ?age]]", "aggregation"),
-            Example(schema, "Find oldest user age", "[:find (max ?age) :where [?e :user/age ?age]]", "aggregation"),
-            Example(schema, "Find youngest user age", "[:find (min ?age) :where [?e :user/age ?age]]", "aggregation"),
-            Example(schema, "Median user age", "[:find (median ?age) :where [?e :user/age ?age]]", "aggregation"),
-            Example(schema, "Count users by role", "[:find ?role (count ?e) :where [?e :user/role ?role]]", "aggregation"),
-            Example(schema, "How many users are there", "[:find (count ?e) :where [?e :user/name _]]", "aggregation"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Count all products", "[:find (count ?e) :where [?e :product/name _]]", "aggregation"),
-            Example(schema, "Count all orders", "[:find (count ?e) :where [?e :order/total _]]", "aggregation"),
-            Example(schema, "Average product price", "[:find (avg ?p) :where [?e :product/price ?p]]", "aggregation"),
-            Example(schema, "Total order revenue", "[:find (sum ?t) :where [?e :order/total ?t]]", "aggregation"),
-            Example(schema, "Average order total", "[:find (avg ?t) :where [?e :order/total ?t]]", "aggregation"),
-            Example(schema, "Maximum product price", "[:find (max ?p) :where [?e :product/price ?p]]", "aggregation"),
-            Example(schema, "Count products by category", "[:find ?cat (count ?e) :where [?e :product/category ?cat]]", "aggregation"),
-            Example(schema, "Count orders by status", "[:find ?status (count ?e) :where [?e :order/status ?status]]", "aggregation"),
-            Example(schema, "Total stock across all products", "[:find (sum ?s) :where [?e :product/stock ?s]]", "aggregation"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Count all posts", "[:find (count ?e) :where [?e :post/title _]]", "aggregation"),
-            Example(schema, "Total views across all posts", "[:find (sum ?v) :where [?e :post/views ?v]]", "aggregation"),
-            Example(schema, "Average post views", "[:find (avg ?v) :where [?e :post/views ?v]]", "aggregation"),
-            Example(schema, "Most viewed post views count", "[:find (max ?v) :where [?e :post/views ?v]]", "aggregation"),
-            Example(schema, "Count posts by tag", "[:find ?tag (count ?e) :where [?e :post/tags ?tag]]", "aggregation"),
-            Example(schema, "Count comments", "[:find (count ?e) :where [?e :comment/text _]]", "aggregation"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Count employees", "[:find (count ?e) :where [?e :employee/name _]]", "aggregation"),
-            Example(schema, "Average salary", "[:find (avg ?s) :where [?e :employee/salary ?s]]", "aggregation"),
-            Example(schema, "Total salary expense", "[:find (sum ?s) :where [?e :employee/salary ?s]]", "aggregation"),
-            Example(schema, "Highest salary", "[:find (max ?s) :where [?e :employee/salary ?s]]", "aggregation"),
-            Example(schema, "Lowest salary", "[:find (min ?s) :where [?e :employee/salary ?s]]", "aggregation"),
-            Example(schema, "Median salary", "[:find (median ?s) :where [?e :employee/salary ?s]]", "aggregation"),
-            Example(schema, "Count departments", "[:find (count ?e) :where [?e :department/name _]]", "aggregation"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Count all books", "[:find (count ?e) :where [?e :book/title _]]", "aggregation"),
-            Example(schema, "Average book pages", "[:find (avg ?p) :where [?e :book/pages ?p]]", "aggregation"),
-            Example(schema, "Count books by genre", "[:find ?genre (count ?e) :where [?e :book/genre ?genre]]", "aggregation"),
-            Example(schema, "Count active loans", "[:find (count ?e) :where [?e :loan/book _] (not [?e :loan/returned _])]", "aggregation"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Count all items", "[:find (count ?e) :where [?e :item/name _]]", "aggregation"),
-            Example(schema, "Total inventory value", "[:find (sum ?v) :where [?e :item/quantity ?q] [?e :item/unit-cost ?c] [(* ?q ?c) ?v]]", "aggregation"),
-            Example(schema, "Total quantity across all items", "[:find (sum ?q) :where [?e :item/quantity ?q]]", "aggregation"),
-        ])
+            def phrase(rel: str, tail: str) -> str:
+                # Participle attrs read directly ("posts published after 2024");
+                # noun attrs need a frame ("permits with expiry date after 2024").
+                if a.participle:
+                    return f"Find {e.plural} {a.name.replace('-', ' ')} {rel} {tail}"
+                return f"Find {e.plural} with {w} {rel} {tail}"
 
-    return examples
+            for y in YEARS:
+                out.append(Example(
+                    s, phrase("after", y),
+                    f'[:find ?e :where [?e {kw} ?d] [(> ?d #inst "{y}-01-01")]]', "date"))
+                out.append(Example(
+                    s, phrase("before", y),
+                    f'[:find ?e :where [?e {kw} ?d] [(< ?d #inst "{y}-01-01")]]', "date"))
+                out.append(Example(
+                    s, phrase("during", y),
+                    f'[:find ?e :where [?e {kw} ?d] [(>= ?d #inst "{y}-01-01")] '
+                    f'[(< ?d #inst "{int(y)+1}-01-01")]]', "date"))
+            out.append(Example(
+                s, phrase("before", "a given date"),
+                f"[:find ?e :in $ ?cutoff :where [?e {kw} ?d] [(< ?d ?cutoff)]]", "date"))
+    return out
 
 
-def generate_joins(schema: Schema) -> List[Example]:
-    """Generate join queries."""
-    examples = []
+def g_aggregations(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        cnt = f"[:find (count ?e) :where [?e {e.primary_kw} _]]"
+        out.append(Example(s, f"Count all {e.plural}", cnt, "aggregation"))
+        out.append(Example(s, f"How many {e.plural} are there", cnt, "aggregation"))
 
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find users and their friends names", "[:find ?name ?friend-name :where [?e :user/name ?name] [?e :user/friends ?f] [?f :user/name ?friend-name]]", "join"),
-            Example(schema, "Find user pairs who are friends", "[:find ?n1 ?n2 :where [?e1 :user/name ?n1] [?e1 :user/friends ?e2] [?e2 :user/name ?n2]]", "join"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find orders with customer names", "[:find ?order ?name :where [?order :order/user ?user] [?user :user/name ?name]]", "join"),
-            Example(schema, "Find product names in each order", "[:find ?order ?product-name :where [?order :order/products ?product] [?product :product/name ?product-name]]", "join"),
-            Example(schema, "Orders with total and customer email", "[:find ?total ?email :where [?o :order/total ?total] [?o :order/user ?u] [?u :user/email ?email]]", "join"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find posts with author names", "[:find ?title ?author-name :where [?p :post/title ?title] [?p :post/author ?a] [?a :author/name ?author-name]]", "join"),
-            Example(schema, "Find comments with post titles", "[:find ?comment ?title :where [?c :comment/text ?comment] [?c :comment/post ?p] [?p :post/title ?title]]", "join"),
-            Example(schema, "Find comments with author and post info", "[:find ?comment ?author-name ?post-title :where [?c :comment/text ?comment] [?c :comment/author ?a] [?a :author/name ?author-name] [?c :comment/post ?p] [?p :post/title ?post-title]]", "join"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find employees with department names", "[:find ?emp-name ?dept-name :where [?e :employee/name ?emp-name] [?e :employee/department ?d] [?d :department/name ?dept-name]]", "join"),
-            Example(schema, "Find employees with their manager names", "[:find ?emp ?mgr :where [?e :employee/name ?emp] [?e :employee/manager ?m] [?m :employee/name ?mgr]]", "join"),
-            Example(schema, "Find employees and manager in same department", "[:find ?emp ?mgr :where [?e :employee/name ?emp] [?e :employee/department ?d] [?e :employee/manager ?m] [?m :employee/name ?mgr] [?m :employee/department ?d]]", "join"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find loans with book titles", "[:find ?loan ?title :where [?loan :loan/book ?b] [?b :book/title ?title]]", "join"),
-            Example(schema, "Find loans with member names", "[:find ?loan ?name :where [?loan :loan/member ?m] [?m :member/name ?name]]", "join"),
-            Example(schema, "Find who borrowed which book", "[:find ?member-name ?book-title :where [?l :loan/member ?m] [?m :member/name ?member-name] [?l :loan/book ?b] [?b :book/title ?book-title]]", "join"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Find items with location names", "[:find ?item-name ?loc-name :where [?i :item/name ?item-name] [?i :item/location ?l] [?l :location/name ?loc-name]]", "join"),
-            Example(schema, "Items in warehouse locations", "[:find ?item-name :where [?i :item/name ?item-name] [?i :item/location ?l] [?l :location/type :warehouse]]", "join"),
-        ])
+        for a in e.by_type("long", "double"):
+            kw, w = e.kw(a.name), a.words()
+            for fn, phrase in (("sum", f"Total {w} across all {e.plural}"),
+                               ("avg", f"Average {e.noun} {w}"),
+                               ("max", f"Highest {e.noun} {w}"),
+                               ("min", f"Lowest {e.noun} {w}"),
+                               ("median", f"Median {e.noun} {w}")):
+                out.append(Example(s, phrase,
+                                   f"[:find ({fn} ?v) :where [?e {kw} ?v]]", "aggregation"))
 
-    return examples
+        for a in e.by_type("keyword"):
+            out.append(Example(
+                s, f"Count {e.plural} by {a.words()}",
+                f"[:find ?g (count ?e) :where [?e {e.kw(a.name)} ?g]]", "aggregation"))
+    return out
 
 
-def generate_negations(schema: Schema) -> List[Example]:
-    """Generate negation queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find users without email", "[:find ?e :where [?e :user/name _] (not [?e :user/email _])]", "negation"),
-            Example(schema, "Find inactive users", "[:find ?e :where [?e :user/name _] (not [?e :user/active true])]", "negation"),
-            Example(schema, "Find users with no friends", "[:find ?e :where [?e :user/name _] (not [?e :user/friends _])]", "negation"),
-            Example(schema, "Find non-admin users", "[:find ?e :where [?e :user/name _] (not [?e :user/role :admin])]", "negation"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find products not in any category", "[:find ?e :where [?e :product/name _] (not [?e :product/category _])]", "negation"),
-            Example(schema, "Find orders without products", "[:find ?e :where [?e :order/total _] (not [?e :order/products _])]", "negation"),
-            Example(schema, "Find non-shipped orders", "[:find ?e :where [?e :order/status _] (not [?e :order/status :shipped])]", "negation"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find posts without tags", "[:find ?e :where [?e :post/title _] (not [?e :post/tags _])]", "negation"),
-            Example(schema, "Find posts without comments", "[:find ?e :where [?e :post/title _] (not [?c :comment/post ?e])]", "negation"),
-            Example(schema, "Find authors without posts", "[:find ?e :where [?e :author/name _] (not [?p :post/author ?e])]", "negation"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find employees without manager", "[:find ?e :where [?e :employee/name _] (not [?e :employee/manager _])]", "negation"),
-            Example(schema, "Find employees not in any department", "[:find ?e :where [?e :employee/name _] (not [?e :employee/department _])]", "negation"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find books never borrowed", "[:find ?e :where [?e :book/title _] (not [?l :loan/book ?e])]", "negation"),
-            Example(schema, "Find unreturned loans", "[:find ?e :where [?e :loan/book _] (not [?e :loan/returned _])]", "negation"),
-            Example(schema, "Find members with no loans", "[:find ?e :where [?e :member/name _] (not [?l :loan/member ?e])]", "negation"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Find items without location", "[:find ?e :where [?e :item/name _] (not [?e :item/location _])]", "negation"),
-        ])
-
-    return examples
+def g_joins(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.attrs:
+            if a.type != "ref" or not a.ref_to:
+                continue
+            t = s.entity(a.ref_to)
+            if t is None:
+                continue
+            ekw, akw, tkw = e.primary_kw, e.kw(a.name), t.primary_kw
+            out.append(Example(
+                s, f"Find {e.plural} with their {a.words()} {t.primary}",
+                f"[:find ?x ?y :where [?e {ekw} ?x] [?e {akw} ?t] [?t {tkw} ?y]]", "join"))
+            out.append(Example(
+                s, f"Show each {e.noun} and the {t.noun} it links to",
+                f"[:find ?x ?y :where [?e {ekw} ?x] [?e {akw} ?t] [?t {tkw} ?y]]", "join"))
+            for k in t.by_type("keyword")[:1]:
+                for v in k.values[:1]:
+                    out.append(Example(
+                        s, f"Find {e.plural} whose {t.noun} has {k.words()} {v.lstrip(':')}",
+                        f"[:find ?x :where [?e {ekw} ?x] [?e {akw} ?t] [?t {t.kw(k.name)} {v}]]",
+                        "join"))
+    return out
 
 
-def generate_pull_queries(schema: Schema) -> List[Example]:
-    """Generate pull syntax queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Get full user details", "[:find (pull ?e [*]) :where [?e :user/name _]]", "pull"),
-            Example(schema, "Get user name and email only", "[:find (pull ?e [:user/name :user/email]) :where [?e :user/name _]]", "pull"),
-            Example(schema, "Get active users with all attributes", "[:find (pull ?e [*]) :where [?e :user/active true]]", "pull"),
-            Example(schema, "Get users with their friends", "[:find (pull ?e [:user/name {:user/friends [:user/name]}]) :where [?e :user/name _]]", "pull"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Get full product details", "[:find (pull ?e [*]) :where [?e :product/name _]]", "pull"),
-            Example(schema, "Get order with products", "[:find (pull ?e [:order/total {:order/products [:product/name :product/price]}]) :where [?e :order/total _]]", "pull"),
-            Example(schema, "Get order with customer info", "[:find (pull ?e [:order/total :order/date {:order/user [:user/name :user/email]}]) :where [?e :order/total _]]", "pull"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Get full post details", "[:find (pull ?e [*]) :where [?e :post/title _]]", "pull"),
-            Example(schema, "Get posts with author info", "[:find (pull ?e [:post/title {:post/author [:author/name]}]) :where [?e :post/title _]]", "pull"),
-            Example(schema, "Get post with comments", "[:find (pull ?p [:post/title :post/body]) (pull ?c [:comment/text]) :where [?p :post/title _] [?c :comment/post ?p]]", "pull"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Get employee with department", "[:find (pull ?e [:employee/name :employee/title {:employee/department [:department/name]}]) :where [?e :employee/name _]]", "pull"),
-            Example(schema, "Get full employee details", "[:find (pull ?e [*]) :where [?e :employee/name _]]", "pull"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Get full book details", "[:find (pull ?e [*]) :where [?e :book/title _]]", "pull"),
-            Example(schema, "Get loan with book and member", "[:find (pull ?l [:loan/borrowed :loan/due {:loan/book [:book/title]} {:loan/member [:member/name]}]) :where [?l :loan/book _]]", "pull"),
-        ])
-
-    return examples
+def g_negations(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.attrs:
+            if a.name == e.primary:
+                continue
+            out.append(Example(
+                s, f"Find {e.plural} with no {a.words()}",
+                f"[:find ?e :where [?e {e.primary_kw} _] (not [?e {e.kw(a.name)} _])]",
+                "negation"))
+        for a in e.by_type("keyword"):
+            for v in a.values[:1]:
+                out.append(Example(
+                    s, f"Find {e.plural} whose {a.words()} is not {v.lstrip(':')}",
+                    f"[:find ?e :where [?e {e.primary_kw} _] (not [?e {e.kw(a.name)} {v}])]",
+                    "negation"))
+    # reverse-reference negation: entities nothing points at
+    for e in s.entities:
+        for a in e.attrs:
+            if a.type == "ref" and a.ref_to and s.entity(a.ref_to):
+                t = s.entity(a.ref_to)
+                out.append(Example(
+                    s, f"Find {t.plural} not referenced by any {e.noun}",
+                    f"[:find ?t :where [?t {t.primary_kw} _] (not [?e {e.kw(a.name)} ?t])]",
+                    "negation"))
+    return out
 
 
-def generate_fulltext_queries(schema: Schema) -> List[Example]:
-    """Generate full-text search queries (Datalevin-specific)."""
-    examples = []
-
-    if schema.name == "blog":
-        examples.extend([
-            Example(schema, "Search posts for clojure", '[:find ?e ?a ?v :where [(fulltext $ "clojure") [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search post titles for programming", '[:find ?e ?a ?v :where [(fulltext $ :post/title "programming") [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search posts for machine learning", '[:find ?e ?a ?v :where [(fulltext $ "machine learning") [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search for exact phrase functional programming", '[:find ?e ?a ?v :where [(fulltext $ {:phrase "functional programming"}) [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search for clojure but not java", '[:find ?e ?a ?v :where [(fulltext $ [:and "clojure" [:not "java"]]) [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search for python or javascript", '[:find ?e ?a ?v :where [(fulltext $ [:or "python" "javascript"]) [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search author bios for expert", '[:find ?e ?a ?v :where [(fulltext $ :author/bio "expert") [[?e ?a ?v]]]]', "fulltext"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Search books for science fiction", '[:find ?e ?a ?v :where [(fulltext $ "science fiction") [[?e ?a ?v]]]]', "fulltext"),
-            Example(schema, "Search book titles for adventure", '[:find ?e ?a ?v :where [(fulltext $ :book/title "adventure") [[?e ?a ?v]]]]', "fulltext"),
-        ])
-
-    return examples
-
-
-def generate_or_queries(schema: Schema) -> List[Example]:
-    """Generate OR clause queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find active or admin users", "[:find ?e :where (or [?e :user/active true] [?e :user/role :admin])]", "or"),
-            Example(schema, "Find users named John or Jane", '[:find ?e :where (or [?e :user/name "John"] [?e :user/name "Jane"])]', "or"),
-            Example(schema, "Find young or old users", "[:find ?e :where [?e :user/age ?age] (or [(< ?age 20)] [(> ?age 60)])]", "or"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find pending or processing orders", "[:find ?e :where (or [?e :order/status :pending] [?e :order/status :processing])]", "or"),
-            Example(schema, "Find electronics or clothing products", "[:find ?e :where (or [?e :product/category :electronics] [?e :product/category :clothing])]", "or"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find posts tagged clojure or java", "[:find ?e :where (or [?e :post/tags :clojure] [?e :post/tags :java])]", "or"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find engineers or managers", '[:find ?e :where (or [?e :employee/title "Engineer"] [?e :employee/title "Manager"])]', "or"),
-        ])
-
-    return examples
+def g_pull(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        out.append(Example(
+            s, f"Get full {e.noun} details",
+            f"[:find (pull ?e [*]) :where [?e {e.primary_kw} _]]", "pull"))
+        scalars = [a for a in e.scalars() if not a.many][:2]
+        if len(scalars) == 2:
+            out.append(Example(
+                s, f"Get only {e.noun} {scalars[0].words()} and {scalars[1].words()}",
+                f"[:find (pull ?e [{e.kw(scalars[0].name)} {e.kw(scalars[1].name)}]) "
+                f":where [?e {e.primary_kw} _]]", "pull"))
+        for a in e.attrs:
+            if a.type == "ref" and a.ref_to and s.entity(a.ref_to):
+                t = s.entity(a.ref_to)
+                out.append(Example(
+                    s, f"Get {e.plural} with their {a.words()} expanded",
+                    f"[:find (pull ?e [{e.primary_kw} {{{e.kw(a.name)} [{t.primary_kw}]}}]) "
+                    f":where [?e {e.primary_kw} _]]", "pull"))
+                break
+    return out
 
 
-def generate_return_formats(schema: Schema) -> List[Example]:
-    """Generate queries with different return formats."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Get all unique user names as a list", "[:find [?name ...] :where [_ :user/name ?name]]", "return-format"),
-            Example(schema, "Get single user by email", '[:find ?e . :where [?e :user/email "admin@example.com"]]', "return-format"),
-            Example(schema, "Get first user name and age", "[:find [?name ?age] :where [?e :user/name ?name] [?e :user/age ?age]]", "return-format"),
-            Example(schema, "Get users as maps with keys", "[:find ?e ?name ?email :keys id name email :where [?e :user/name ?name] [?e :user/email ?email]]", "return-format"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Get all unique categories as a list", "[:find [?cat ...] :where [_ :product/category ?cat]]", "return-format"),
-            Example(schema, "Get all unique order statuses", "[:find [?status ...] :where [_ :order/status ?status]]", "return-format"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Get all unique tags", "[:find [?tag ...] :where [_ :post/tags ?tag]]", "return-format"),
-        ])
-
-    return examples
+def g_or(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.by_type("keyword"):
+            if len(a.values) < 2:
+                continue
+            v1, v2 = a.values[0], a.values[1]
+            out.append(Example(
+                s, f"Find {e.plural} with {a.words()} {v1.lstrip(':')} or {v2.lstrip(':')}",
+                f"[:find ?e :where (or [?e {e.kw(a.name)} {v1}] [?e {e.kw(a.name)} {v2}])]",
+                "or"))
+        nums = e.by_type("long", "double")
+        if nums and len(nums[0].nums) >= 2:
+            a = nums[0]
+            lo, hi = a.nums[0], a.nums[1]
+            out.append(Example(
+                s, f"Find {e.plural} with {a.words()} below {lo} or above {hi}",
+                f"[:find ?e :where [?e {e.kw(a.name)} ?v] (or [(< ?v {lo})] [(> ?v {hi})])]",
+                "or"))
+    return out
 
 
-def generate_with_inputs(schema: Schema) -> List[Example]:
-    """Generate queries that use :in clause for inputs."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find user by given name", "[:find ?e :in $ ?name :where [?e :user/name ?name]]", "input"),
-            Example(schema, "Find users by given role", "[:find ?e :in $ ?role :where [?e :user/role ?role]]", "input"),
-            Example(schema, "Find users in age range", "[:find ?e :in $ ?min ?max :where [?e :user/age ?age] [(>= ?age ?min)] [(<= ?age ?max)]]", "input"),
-            Example(schema, "Find users with any of these emails", "[:find ?e :in $ [?email ...] :where [?e :user/email ?email]]", "input"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find products by given category", "[:find ?e :in $ ?cat :where [?e :product/category ?cat]]", "input"),
-            Example(schema, "Find products in price range", "[:find ?e :in $ ?min ?max :where [?e :product/price ?p] [(>= ?p ?min)] [(<= ?p ?max)]]", "input"),
-            Example(schema, "Find orders by status", "[:find ?e :in $ ?status :where [?e :order/status ?status]]", "input"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find employees by department", "[:find ?e :in $ ?dept :where [?e :employee/department ?d] [?d :department/name ?dept]]", "input"),
-            Example(schema, "Find employees in salary range", "[:find ?e :in $ ?min ?max :where [?e :employee/salary ?s] [(>= ?s ?min)] [(<= ?s ?max)]]", "input"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find books by genre", "[:find ?e :in $ ?genre :where [?e :book/genre ?genre]]", "input"),
-            Example(schema, "Find books by author name", "[:find ?e :in $ ?author :where [?e :book/author ?author]]", "input"),
-        ])
-
-    return examples
+def g_return_formats(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.by_type("keyword", "string")[:2]:
+            out.append(Example(
+                s, f"Get all distinct {e.noun} {a.words()} values as a list",
+                f"[:find [?v ...] :where [_ {e.kw(a.name)} ?v]]", "return-format"))
+        uniq = [a for a in e.attrs if a.unique]
+        if uniq:
+            a = uniq[0]
+            out.append(Example(
+                s, f"Get the single {e.noun} with a given {a.words()}",
+                f"[:find ?e . :in $ ?v :where [?e {e.kw(a.name)} ?v]]", "return-format"))
+        scalars = [a for a in e.scalars() if not a.many][:2]
+        if len(scalars) == 2:
+            n1, n2 = scalars[0].name.replace("-", "_"), scalars[1].name.replace("-", "_")
+            out.append(Example(
+                s, f"Get {e.plural} as maps keyed by {scalars[0].words()} and {scalars[1].words()}",
+                f"[:find ?a ?b :keys {n1} {n2} :where "
+                f"[?e {e.kw(scalars[0].name)} ?a] [?e {e.kw(scalars[1].name)} ?b]]",
+                "return-format"))
+    return out
 
 
-def generate_complex_queries(schema: Schema) -> List[Example]:
-    """Generate more complex combined queries."""
-    examples = []
-
-    if schema.name == "users":
-        examples.extend([
-            Example(schema, "Find active adult users with gmail", '[:find ?e ?name :where [?e :user/name ?name] [?e :user/active true] [?e :user/age ?age] [(>= ?age 18)] [?e :user/email ?email] [(clojure.string/includes? ?email "gmail")]]', "complex"),
-            Example(schema, "Count active users by role", "[:find ?role (count ?e) :where [?e :user/active true] [?e :user/role ?role]]", "complex"),
-        ])
-    elif schema.name == "ecommerce":
-        examples.extend([
-            Example(schema, "Find high-value completed orders with customer info", "[:find ?total ?name ?email :where [?o :order/total ?total] [(> ?total 500.0)] [?o :order/status :completed] [?o :order/user ?u] [?u :user/name ?name] [?u :user/email ?email]]", "complex"),
-            Example(schema, "Find low stock active products", "[:find ?name ?stock :where [?e :product/name ?name] [?e :product/stock ?stock] [(< ?stock 10)] [?e :product/active true]]", "complex"),
-            Example(schema, "Total revenue by category", "[:find ?cat (sum ?total) :where [?o :order/products ?p] [?p :product/category ?cat] [?o :order/total ?total]]", "complex"),
-        ])
-    elif schema.name == "blog":
-        examples.extend([
-            Example(schema, "Find popular posts from 2024 by author", "[:find ?title ?author-name ?views :where [?p :post/title ?title] [?p :post/views ?views] [(> ?views 1000)] [?p :post/published ?d] [(>= ?d #inst \"2024-01-01\")] [?p :post/author ?a] [?a :author/name ?author-name]]", "complex"),
-            Example(schema, "Count comments per post", "[:find ?title (count ?c) :where [?p :post/title ?title] [?c :comment/post ?p]]", "complex"),
-        ])
-    elif schema.name == "hr":
-        examples.extend([
-            Example(schema, "Find high earners by department", "[:find ?name ?dept-name ?salary :where [?e :employee/name ?name] [?e :employee/salary ?salary] [(> ?salary 100000.0)] [?e :employee/department ?d] [?d :department/name ?dept-name]]", "complex"),
-            Example(schema, "Average salary by department", "[:find ?dept-name (avg ?salary) :where [?e :employee/salary ?salary] [?e :employee/department ?d] [?d :department/name ?dept-name]]", "complex"),
-            Example(schema, "Count employees by department", "[:find ?dept-name (count ?e) :where [?e :employee/department ?d] [?d :department/name ?dept-name]]", "complex"),
-        ])
-    elif schema.name == "library":
-        examples.extend([
-            Example(schema, "Find overdue loans with book and member info", "[:find ?member-name ?book-title ?due :in $ ?now :where [?l :loan/due ?due] [(< ?due ?now)] (not [?l :loan/returned _]) [?l :loan/member ?m] [?m :member/name ?member-name] [?l :loan/book ?b] [?b :book/title ?book-title]]", "complex"),
-            Example(schema, "Count loans per member", "[:find ?name (count ?l) :where [?l :loan/member ?m] [?m :member/name ?name]]", "complex"),
-        ])
-    elif schema.name == "inventory":
-        examples.extend([
-            Example(schema, "Find items needing reorder with location", "[:find ?name ?qty ?reorder ?loc-name :where [?i :item/name ?name] [?i :item/quantity ?qty] [?i :item/reorder-point ?reorder] [(< ?qty ?reorder)] [?i :item/location ?l] [?l :location/name ?loc-name]]", "complex"),
-        ])
-
-    return examples
+def g_inputs(s: Schema) -> List[Example]:
+    out = []
+    for e in s.entities:
+        for a in e.by_type("keyword", "string")[:2]:
+            out.append(Example(
+                s, f"Find {e.plural} by a given {a.words()}",
+                f"[:find ?e :in $ ?v :where [?e {e.kw(a.name)} ?v]]", "input"))
+            out.append(Example(
+                s, f"Find {e.plural} matching any of several {a.words()} values",
+                f"[:find ?e :in $ [?v ...] :where [?e {e.kw(a.name)} ?v]]", "input"))
+        for a in e.by_type("long", "double")[:1]:
+            out.append(Example(
+                s, f"Find {e.plural} with {a.words()} in a given range",
+                f"[:find ?e :in $ ?min ?max :where [?e {e.kw(a.name)} ?v] "
+                f"[(>= ?v ?min)] [(<= ?v ?max)]]", "input"))
+    return out
 
 
-def generate_all_examples() -> List[Example]:
-    """Generate all training examples."""
-    examples = []
+def g_fulltext(s: Schema) -> List[Example]:
+    """Datalevin-specific full-text search."""
+    out = []
+    for e in s.entities:
+        for a in e.attrs:
+            if not a.fulltext:
+                continue
+            kw = e.kw(a.name)
+            term = a.subs[0] if a.subs else e.noun
+            out.append(Example(
+                s, f"Search {e.plural} for {term}",
+                f'[:find ?e ?a ?v :where [(fulltext $ "{term}") [[?e ?a ?v]]]]', "fulltext"))
+            out.append(Example(
+                s, f"Search {e.noun} {a.words()} for {term}",
+                f'[:find ?e ?a ?v :where [(fulltext $ {kw} "{term}") [[?e ?a ?v]]]]', "fulltext"))
+            out.append(Example(
+                s, f"Search {e.plural} for the exact phrase {term} guide",
+                f'[:find ?e ?a ?v :where [(fulltext $ {{:phrase "{term} guide"}}) '
+                f'[[?e ?a ?v]]]]', "fulltext"))
+            out.append(Example(
+                s, f"Search {e.plural} for {term} but not draft",
+                f'[:find ?e ?a ?v :where [(fulltext $ [:and "{term}" [:not "draft"]]) '
+                f'[[?e ?a ?v]]]]', "fulltext"))
+            out.append(Example(
+                s, f"Search {e.plural} for {term} or archive",
+                f'[:find ?e ?a ?v :where [(fulltext $ [:or "{term}" "archive"]) '
+                f'[[?e ?a ?v]]]]', "fulltext"))
+    return out
 
-    generators = [
-        generate_basic_finds,
-        generate_equality_filters,
-        generate_comparison_filters,
-        generate_string_operations,
-        generate_date_operations,
-        generate_aggregations,
-        generate_joins,
-        generate_negations,
-        generate_pull_queries,
-        generate_fulltext_queries,
-        generate_or_queries,
-        generate_return_formats,
-        generate_with_inputs,
-        generate_complex_queries,
-    ]
 
-    for schema in SCHEMAS:
-        for generator in generators:
-            examples.extend(generator(schema))
+def g_complex(s: Schema) -> List[Example]:
+    """Multi-clause compositions -- the shapes users actually struggle to write."""
+    out = []
+    for e in s.entities:
+        nums = e.by_type("long", "double")
+        refs = [a for a in e.attrs if a.type == "ref" and a.ref_to and s.entity(a.ref_to)]
+        kws = e.by_type("keyword")
+        bools = e.by_type("boolean")
 
-    return examples
+        # numeric filter + join projection
+        if nums and refs and nums[0].nums:
+            a, r = nums[0], refs[0]
+            t = s.entity(r.ref_to)
+            out.append(Example(
+                s, f"Find {e.plural} with {a.words()} over {a.nums[0]} "
+                   f"along with their {t.noun} {t.primary}",
+                f"[:find ?x ?y :where [?e {e.primary_kw} ?x] [?e {e.kw(a.name)} ?v] "
+                f"[(> ?v {a.nums[0]})] [?e {e.kw(r.name)} ?t] [?t {t.primary_kw} ?y]]",
+                "complex"))
+
+        # group-by across a join
+        if nums and refs and nums[0].nums:
+            a, r = nums[0], refs[0]
+            t = s.entity(r.ref_to)
+            out.append(Example(
+                s, f"Average {e.noun} {a.words()} grouped by {t.noun}",
+                f"[:find ?y (avg ?v) :where [?e {e.kw(a.name)} ?v] "
+                f"[?e {e.kw(r.name)} ?t] [?t {t.primary_kw} ?y]]", "complex"))
+            out.append(Example(
+                s, f"Count {e.plural} per {t.noun}",
+                f"[:find ?y (count ?e) :where [?e {e.kw(r.name)} ?t] [?t {t.primary_kw} ?y]]",
+                "complex"))
+
+        # boolean + keyword + numeric stacked
+        if bools and kws and nums and kws[0].values and nums[0].nums:
+            b, k, n = bools[0], kws[0], nums[0]
+            out.append(Example(
+                s, f"Find {b.words()} {e.plural} with {k.words()} "
+                   f"{k.values[0].lstrip(':')} and {n.words()} above {n.nums[0]}",
+                f"[:find ?e :where [?e {e.kw(b.name)} true] [?e {e.kw(k.name)} {k.values[0]}] "
+                f"[?e {e.kw(n.name)} ?v] [(> ?v {n.nums[0]})]]", "complex"))
+
+        # date filter + negation + join (the "overdue loans" shape)
+        dates = e.by_type("instant")
+        if len(dates) >= 2 and refs:
+            d1, d2 = dates[0], dates[1]
+            r = refs[0]
+            t = s.entity(r.ref_to)
+            out.append(Example(
+                s, f"Find {e.plural} past {d2.words()} with no {d1.words()}, "
+                   f"including {t.noun} {t.primary}",
+                f"[:find ?y ?d :in $ ?now :where [?e {e.kw(d2.name)} ?d] [(< ?d ?now)] "
+                f"(not [?e {e.kw(d1.name)} _]) [?e {e.kw(r.name)} ?t] [?t {t.primary_kw} ?y]]",
+                "complex"))
+
+        # computed binding
+        if len(nums) >= 2:
+            a, b = nums[0], nums[1]
+            out.append(Example(
+                s, f"Total {a.words()} times {b.words()} across {e.plural}",
+                f"[:find (sum ?p) :where [?e {e.kw(a.name)} ?x] [?e {e.kw(b.name)} ?y] "
+                f"[(* ?x ?y) ?p]]", "complex"))
+    return out
+
+
+GENERATORS = [
+    g_basic, g_equality, g_comparison, g_string, g_dates, g_aggregations,
+    g_joins, g_negations, g_pull, g_or, g_return_formats, g_inputs,
+    g_fulltext, g_complex,
+]
+
+
+# --------------------------------------------------------------------------
+# Validation -- catch generator bugs before they become training targets
+# --------------------------------------------------------------------------
+
+ATTR_RE = re.compile(r':[a-z][\w-]*/[\w-]+')
+PAIRS = {')': '(', ']': '[', '}': '{'}
+
+
+def balanced(q: str) -> bool:
+    stack = []
+    in_str = False
+    i = 0
+    while i < len(q):
+        c = q[i]
+        if in_str:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in '([{':
+            stack.append(c)
+        elif c in ')]}':
+            if not stack or stack.pop() != PAIRS[c]:
+                return False
+        i += 1
+    return not stack and not in_str
+
+
+def validate(ex: Example) -> List[str]:
+    errs = []
+    if not balanced(ex.query):
+        errs.append("unbalanced delimiters")
+    if not ex.query.startswith("[:find"):
+        errs.append("does not start with [:find")
+    known = ex.schema.attr_kws
+    for kw in ATTR_RE.findall(ex.query):
+        if kw.startswith(":db"):
+            continue
+        if kw not in known:
+            errs.append(f"attribute {kw} not in schema")
+    # every ?var in :find must be bound somewhere in :where
+    head, _, tail = ex.query.partition(":where")
+    for v in set(re.findall(r'\?[\w-]+', head)):
+        if v not in tail and v not in head.split(":in")[-1]:
+            errs.append(f"{v} in :find is unbound")
+    return errs
+
+
+# --------------------------------------------------------------------------
+
+# Prompt format must match the base model's chat template exactly. Training with
+# the wrong control tokens is silent -- they tokenize as ordinary text and the
+# model never learns the turn boundaries. Qwen uses ChatML; SmolLM does not.
+CHAT_TEMPLATES = {
+    "chatml": (
+        "<|im_start|>system\n{system}<|im_end|>\n"
+        "<|im_start|>user\nSchema: {schema}\n\n{nl}<|im_end|>\n"
+        "<|im_start|>assistant\n{query}<|im_end|>"
+    ),
+    "smollm": "<|user|>Schema: {schema}\n\n{nl}<|assistant|>{query}",
+}
+
+SYSTEM = ("You translate natural language into Datalevin Datalog queries. "
+          "Use only attributes present in the given schema. Output only the query.")
+
+TEMPLATE = "chatml"   # base model is Qwen2.5-Coder
 
 
 def format_example(ex: Example) -> str:
-    """Format an example for MLX fine-tuning."""
-    return json.dumps({
-        "text": f"<|user|>Schema: {ex.schema.edn}\n\n{ex.natural}<|assistant|>{ex.query}"
-    })
+    text = CHAT_TEMPLATES[TEMPLATE].format(
+        system=SYSTEM, schema=ex.schema.edn, nl=ex.natural, query=ex.query)
+    return json.dumps({"text": text})
 
 
 def main():
-    print("Generating Datalevin NLQ training data...")
+    print("Generating Datalevin NLQ training data...\n")
 
-    # Generate all examples
-    examples = generate_all_examples()
-    print(f"Generated {len(examples)} examples")
+    examples, problems = [], []
+    for schema in SCHEMAS:
+        for gen in GENERATORS:
+            for ex in gen(schema):
+                errs = validate(ex)
+                if errs:
+                    problems.append((schema.name, ex.natural, ex.query, errs))
+                else:
+                    examples.append(ex)
 
-    # Count by category
-    categories = {}
+    if problems:
+        print(f"!! {len(problems)} invalid examples dropped:")
+        for name, nl, q, errs in problems[:10]:
+            print(f"   [{name}] {nl}\n     {q}\n     -> {'; '.join(errs)}")
+        print()
+
+    # Dedupe on (schema, natural language). Identical prompts with divergent
+    # targets are worse than useless -- they teach the model the task is random.
+    seen, deduped = set(), []
+    collisions = 0
     for ex in examples:
-        categories[ex.category] = categories.get(ex.category, 0) + 1
+        key = (ex.schema.name, ex.natural)
+        if key in seen:
+            collisions += 1
+            continue
+        seen.add(key)
+        deduped.append(ex)
+    examples = deduped
 
-    print("\nExamples by category:")
-    for cat, count in sorted(categories.items()):
-        print(f"  {cat}: {count}")
+    # Rebalance. Template expansion massively over-produces the easy patterns
+    # (every numeric attr x every threshold), while joins and multi-clause
+    # compositions are limited by schema structure. Left alone the mix is the
+    # inverse of what is worth learning, so cap the cheap categories per schema
+    # and let the structurally-scarce ones through untouched.
+    caps = {"basic": 10, "aggregation": 16, "comparison": 14, "date": 10,
+            "negation": 10, "input": 8, "return-format": 7, "pull": 7, "filter": 8}
+    rng = random.Random(SEED)
+    buckets = {}
+    for ex in examples:
+        buckets.setdefault((ex.schema.name, ex.category), []).append(ex)
+    capped = []
+    dropped = 0
+    for (_, cat), group in buckets.items():
+        limit = caps.get(cat)
+        if limit is not None and len(group) > limit:
+            dropped += len(group) - limit
+            group = rng.sample(group, limit)
+        capped.extend(group)
+    examples = capped
 
-    # Shuffle examples
-    random.seed(42)
-    random.shuffle(examples)
+    train = [e for e in examples if e.schema.name not in HOLDOUT]
+    valid = [e for e in examples if e.schema.name in HOLDOUT]
 
-    # Split into train/valid
-    split_idx = int(len(examples) * (1 - VALID_RATIO))
-    train_examples = examples[:split_idx]
-    valid_examples = examples[split_idx:]
+    rng.shuffle(train)
+    rng.shuffle(valid)
 
-    print(f"\nTrain examples: {len(train_examples)}")
-    print(f"Valid examples: {len(valid_examples)}")
+    cats = {}
+    for ex in examples:
+        cats[ex.category] = cats.get(ex.category, 0) + 1
+    print("Examples by category:")
+    for cat, n in sorted(cats.items(), key=lambda kv: -kv[1]):
+        print(f"  {cat:<15} {n}")
 
-    # Write files
+    print(f"\nSchemas:  {len(SCHEMAS)} total "
+          f"({len(SCHEMAS) - len(HOLDOUT)} train / {len(HOLDOUT)} held out)")
+    print(f"Held out: {', '.join(sorted(HOLDOUT))}")
+    print(f"Dropped {collisions} duplicate prompts, {dropped} over-represented")
+    print(f"\nTrain: {len(train)} examples")
+    print(f"Valid: {len(valid)} examples  (schema-disjoint from train)")
+
     with open(TRAIN_FILE, 'w') as f:
-        for ex in train_examples:
+        for ex in train:
             f.write(format_example(ex) + '\n')
-
     with open(VALID_FILE, 'w') as f:
-        for ex in valid_examples:
+        for ex in valid:
             f.write(format_example(ex) + '\n')
 
-    print(f"\nWrote training data to:")
-    print(f"  {TRAIN_FILE}")
-    print(f"  {VALID_FILE}")
+    print(f"\nWrote:\n  {TRAIN_FILE}\n  {VALID_FILE}")
 
 
 if __name__ == "__main__":
